@@ -1,5 +1,6 @@
 from typing import Any
 from typing import Dict
+from typing import List
 from typing import Optional
 from typing import Sequence
 
@@ -7,6 +8,7 @@ import boto3
 from mypy_boto3_glue import GlueClient
 from mypy_boto3_glue.type_defs import ColumnTypeDef
 from mypy_boto3_glue.type_defs import GetTableResponseTypeDef
+from mypy_boto3_glue.type_defs import PartitionInputTypeDef
 from mypy_boto3_glue.type_defs import SerDeInfoTypeDef
 from mypy_boto3_glue.type_defs import StorageDescriptorTypeDef
 from mypy_boto3_glue.type_defs import TableInputTypeDef
@@ -131,12 +133,50 @@ def _convert_columns(column_list: Sequence[Column]) -> Sequence["ColumnTypeDef"]
     return column_types
 
 
-def _create_table(client: "GlueClient", database: str, table_def: "TableInputTypeDef") -> None:
+def _create_table(
+    client: "GlueClient",
+    database: str,
+    table_def: "TableInputTypeDef",
+    partition_columns: List[Dict[str, str]],
+) -> None:
     client.create_table(DatabaseName=database, TableInput=table_def)
+    # Create partition if relevant
+    if partition_columns != []:
+        partition_input, partition_values = _parse_partition_columns(partition_columns, table_def)
+
+        client.create_partition(
+            DatabaseName=database, TableName=table_def["Name"], PartitionInput=partition_input
+        )
 
 
-def _update_table(client: "GlueClient", database: str, table_def: "TableInputTypeDef") -> None:
+def _update_table(
+    client: "GlueClient",
+    database: str,
+    table_def: "TableInputTypeDef",
+    partition_columns: List[Dict[str, str]],
+) -> None:
     client.update_table(DatabaseName=database, TableInput=table_def)
+    # Update or create partition if relevant
+    if partition_columns != []:
+        partition_input, partition_values = _parse_partition_columns(partition_columns, table_def)
+
+        try:
+            client.get_partition(
+                DatabaseName=database,
+                TableName=table_def["Name"],
+                PartitionValues=partition_values,
+            )
+            client.update_partition(
+                DatabaseName=database,
+                TableName=table_def["Name"],
+                PartitionValueList=partition_values,
+                PartitionInput=partition_input,
+            )
+
+        except client.exceptions.EntityNotFoundException:
+            client.create_partition(
+                DatabaseName=database, TableName=table_def["Name"], PartitionInput=partition_input
+            )
 
 
 def _get_table(
@@ -162,14 +202,53 @@ def _get_column_type_def(
         return None
 
 
+def _add_partition_columns(
+    table_def: TableInputTypeDef, partition_columns: List[Dict[str, str]]
+) -> TableInputTypeDef:
+    partition_keys = []
+    if "PartitionKeys" not in table_def:
+        table_def["PartitionKeys"] = []
+    for column in partition_columns:
+        partition_column = ColumnTypeDef(Name=column["Name"], Type=column["Type"])
+        partition_keys.append(partition_column)
+    table_def["PartitionKeys"] = partition_keys
+    # Remove columns from StorageDescriptor if they match with partition columns to avoid duplicate columns
+    for p_column in partition_columns:
+        table_def["StorageDescriptor"]["Columns"] = [
+            column
+            for column in table_def["StorageDescriptor"]["Columns"]
+            if not (column["Name"] == p_column["Name"] and column["Type"] == p_column["Type"])
+        ]
+    return table_def
+
+
+def _parse_partition_columns(
+    partition_columns: List[Dict[str, str]], table_def: TableInputTypeDef
+):
+    partition_input, partition_values = None, None
+    if partition_columns:
+        partition_values = [column["Value"] for column in partition_columns]
+        partition_location = table_def["StorageDescriptor"]["Location"]
+        partition_components = [partition_location]
+        for c in partition_columns:
+            partition_components.append("=".join((c["Name"], c["Value"])))
+        partition_location = "/".join(partition_components)
+
+        partition_input = PartitionInputTypeDef()
+        partition_input["Values"] = partition_values
+        partition_input["StorageDescriptor"] = table_def["StorageDescriptor"]
+        partition_input["StorageDescriptor"]["Location"] = partition_location
+
+    return partition_input, partition_values
+
+
 def _get_table_def(
     table: str,
-    s3_path: str,
+    s3_parent: str,
     columns: Sequence["ColumnTypeDef"],
     file_format: str,
     delimiter: str,
 ):
-    s3_parent = "/".join(s3_path.split("/")[:-1])
     if file_format == "csv":
         table_def = _get_csv_table_def(
             table=table,
@@ -205,25 +284,45 @@ def create_or_update_table(
     s3_path: str,
     file_format: str,
     delimiter: str,
+    partition_columns: List[Dict[str, str]] = [],
 ) -> None:
+    # Set s3 original path if partitioning is used, else use parent path
+    if partition_columns != []:
+        s3_parent = s3_path
+    if partition_columns == []:
+        s3_parent = "/".join(s3_path.split("/")[:-1])
+
     # Existing table in AWS Glue catalog
     glue_table = _get_table(client=client, database=database, table=table)
     columns = _convert_columns(column_list)
     table_def = _get_table_def(
         table=table,
-        s3_path=s3_path,
+        s3_parent=s3_parent,
         columns=columns,
         file_format=file_format,
         delimiter=delimiter,
     )
+    # Add partition columns
+    if partition_columns != []:
+        table_def = _add_partition_columns(table_def, partition_columns)
     if glue_table:
         # Existing columns in AWS Glue catalog
         glue_columns = _get_column_type_def(glue_table)
         # Create new version only if columns are changed
         if glue_columns != columns:
-            _update_table(client=client, database=database, table_def=table_def)
+            _update_table(
+                client=client,
+                database=database,
+                table_def=table_def,
+                partition_columns=partition_columns,
+            )
     else:
-        _create_table(client=client, database=database, table_def=table_def)
+        _create_table(
+            client=client,
+            database=database,
+            table_def=table_def,
+            partition_columns=partition_columns,
+        )
 
 
 class Plugin(BasePlugin):
@@ -236,6 +335,8 @@ class Plugin(BasePlugin):
         assert target_config.location is not None
         assert target_config.relation.identifier is not None
         table: str = target_config.relation.identifier
+        partition_columns = target_config.config.get("partition_columns", [])
+
         create_or_update_table(
             self.client,
             self.database,
@@ -244,4 +345,5 @@ class Plugin(BasePlugin):
             target_config.location.path,
             target_config.location.format,
             self.delimiter,
+            partition_columns,
         )

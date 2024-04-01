@@ -3,7 +3,9 @@ import importlib.util
 import os
 import sys
 import tempfile
+import time
 from typing import Dict
+from typing import List
 from typing import Optional
 
 import duckdb
@@ -31,6 +33,44 @@ def _ensure_event_loop():
         asyncio.set_event_loop(loop)
 
 
+class RetryableCursor:
+    def __init__(self, cursor, retry_attempts: int, retryable_exceptions: List[str]):
+        self._cursor = cursor
+        self._retry_attempts = retry_attempts
+        self._retryable_exceptions = retryable_exceptions
+
+    def execute(self, sql: str, bindings=None):
+        attempt, success, exc = 0, False, None
+        while not success and attempt < self._retry_attempts:
+            try:
+                if bindings is None:
+                    self._cursor.execute(sql)
+                else:
+                    self._cursor.execute(sql, bindings)
+                success = True
+            except Exception as e:
+                exception_name = type(e).__name__
+                if exception_name in self._retryable_exceptions:
+                    time.sleep(2**attempt)
+                    exc = e
+                    attempt += 1
+                else:
+                    print(f"Did not retry exception named '{exception_name}'")
+                    raise e
+        if not success:
+            if exc:
+                raise exc
+            else:
+                raise RuntimeError(
+                    "execute call failed, but no exceptions raised- this should be impossible"
+                )
+        return self
+
+    # forward along all non-execute() methods/attribute look-ups
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
 class Environment(abc.ABC):
     """An Environment is an abstraction to describe *where* the code you execute in your dbt-duckdb project
     actually runs. This could be the local Python process that runs dbt (which is the default),
@@ -45,6 +85,12 @@ class Environment(abc.ABC):
             for path in creds.module_paths:
                 if path not in sys.path:
                     sys.path.append(path)
+
+        major, minor, patch = [int(x) for x in duckdb.__version__.split(".")]
+        if major == 0 and (minor < 10 or (minor == 10 and patch == 0)):
+            self._supports_comments = False
+        else:
+            self._supports_comments = True
 
     @property
     def creds(self) -> DuckDBCredentials:
@@ -69,12 +115,43 @@ class Environment(abc.ABC):
     def get_binding_char(self) -> str:
         return "?"
 
+    def supports_comments(self) -> bool:
+        return self._supports_comments
+
     @classmethod
     def initialize_db(
         cls, creds: DuckDBCredentials, plugins: Optional[Dict[str, BasePlugin]] = None
     ):
         config = creds.config_options or {}
-        conn = duckdb.connect(creds.path, read_only=False, config=config)
+        plugins = plugins or {}
+        for plugin in plugins.values():
+            plugin.update_connection_config(creds, config)
+
+        if creds.retries:
+            success, attempt, exc = False, 0, None
+            while not success and attempt < creds.retries.connect_attempts:
+                try:
+                    conn = duckdb.connect(creds.path, read_only=False, config=config)
+                    success = True
+                except Exception as e:
+                    exception_name = type(e).__name__
+                    if exception_name in creds.retries.retryable_exceptions:
+                        time.sleep(2**attempt)
+                        exc = e
+                        attempt += 1
+                    else:
+                        print(f"Did not retry exception named '{exception_name}'")
+                        raise e
+            if not success:
+                if exc:
+                    raise exc
+                else:
+                    raise RuntimeError(
+                        "connect call failed, but no exceptions raised- this should be impossible"
+                    )
+
+        else:
+            conn = duckdb.connect(creds.path, read_only=False, config=config)
 
         # install any extensions on the connection
         if creds.extensions is not None:
@@ -126,6 +203,11 @@ class Environment(abc.ABC):
 
         for df_name, df in registered_df.items():
             cursor.register(df_name, df)
+
+        if creds.retries and creds.retries.query_attempts:
+            cursor = RetryableCursor(
+                cursor, creds.retries.query_attempts, creds.retries.retryable_exceptions
+            )
 
         return cursor
 

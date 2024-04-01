@@ -14,7 +14,7 @@ This project is hosted on PyPI, so you should be able to install it and the nece
 
 `pip3 install dbt-duckdb`
 
-The latest supported version targets `dbt-core` 1.7.x and `duckdb` version 0.9.x, but we work hard to ensure that newer
+The latest supported version targets `dbt-core` 1.7.x and `duckdb` version 0.10.x, but we work hard to ensure that newer
 versions of DuckDB will continue to work with the adapter as they are released. If you would like to use our new (and experimental!)
 support for persisting the tables that DuckDB creates to the [AWS Glue Catalog](https://aws.amazon.com/glue/), you should install
 `dbt-duckdb[glue]` in order to get the AWS dependencies as well.
@@ -51,7 +51,7 @@ or the Python API.
 
 MotherDuck databases generally work the same way as local DuckDB databases from the perspective of dbt, but
 there are a [few differences to be aware of](https://motherduck.com/docs/architecture-and-capabilities#considerations-and-limitations):
-1. For the moment, MotherDuck _requires_ DuckDB version `0.9.1`.
+1. Currently, MotherDuck _requires_ a specific version of DuckDB, often the latest, as specified in [MotherDuck's documentation](https://motherduck.com/docs/intro/#getting-started)
 1. MotherDuck databases do not suppport transactions, so there is a new `disable_transactions` profile.
 option that will be automatically enabled if you are connecting to a MotherDuck database in your `path`.
 1. MotherDuck preloads a set of the most common DuckDB extensions for you, but does not support loading custom extensions or user-defined functions.
@@ -312,6 +312,8 @@ If the `location` argument is _not_ specified, then the external file will be na
 with an extension that matches the `format` argument (`parquet`, `csv`, or `json`). By default, the external files are created
 relative to the current working directory, but you can change the default directory (or S3 bucket/prefix) by specifying the
 `external_root` setting in your DuckDB profile.
+
+dbt-duckdb supports the `delete+insert` and `append` strategies for incremental `table` models, but unfortunately it does not yet support incremental materialization strategies for `external` models.
 
 #### Re-running external models with an in-memory version of dbt-duckdb
 When using `:memory:` as the DuckDB database, subsequent dbt runs can fail when selecting a subset of models that depend on external tables. This is because external files are only registered as  DuckDB views when they are created, not when they are referenced. To overcome this issue we have provided the `register_upstream_external_models` macro that can be triggered at the beginning of a run. To enable this automatic registration, place the following in your `dbt_project.yml` file:

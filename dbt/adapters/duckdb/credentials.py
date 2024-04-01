@@ -1,6 +1,7 @@
 import os
 import time
 from dataclasses import dataclass
+from dataclasses import field
 from functools import lru_cache
 from typing import Any
 from typing import Dict
@@ -59,6 +60,20 @@ class Remote(dbtClassMixin):
     port: int
     user: str
     password: Optional[str] = None
+
+
+@dataclass
+class Retries(dbtClassMixin):
+    # The number of times to attempt the initial duckdb.connect call
+    # (to wait for another process to free the lock on the DB file)
+    connect_attempts: int = 1
+
+    # The number of times to attempt to execute a DuckDB query that throws
+    # one of the retryable exceptions
+    query_attempts: Optional[int] = None
+
+    # The list of exceptions that we are willing to retry on
+    retryable_exceptions: List[str] = field(default_factory=lambda: ["IOException"])
 
 
 @dataclass
@@ -126,6 +141,29 @@ class DuckDBCredentials(Credentials):
     # provide helper functions for dbt Python models.
     module_paths: Optional[List[str]] = None
 
+    # An optional strategy for allowing retries when certain types of
+    # exceptions occur on a model run (e.g., IOExceptions that were caused
+    # by networking issues)
+    retries: Optional[Retries] = None
+
+    def __post_init__(self):
+        # Add MotherDuck plugin if the path is a MotherDuck database
+        # and plugin was not specified in profile.yml
+        if self.is_motherduck:
+            if self.plugins is None:
+                self.plugins = []
+            if "motherduck" not in [plugin.module for plugin in self.plugins]:
+                self.plugins.append(PluginConfig(module="motherduck"))
+
+    @property
+    def is_motherduck(self):
+        parsed = urlparse(self.path)
+        return self._is_motherduck(parsed.scheme)
+
+    @staticmethod
+    def _is_motherduck(scheme: str) -> bool:
+        return scheme in {"md", "motherduck"}
+
     @classmethod
     def __pre_deserialize__(cls, data: Dict[Any, Any]) -> Dict[Any, Any]:
         data = super().__pre_deserialize__(data)
@@ -139,7 +177,7 @@ class DuckDBCredentials(Credentials):
             path_db = os.path.splitext(base_file)[0]
             # For MotherDuck, turn on disable_transactions unless
             # it's explicitly set already by the user
-            if parsed.scheme in {"md", "motherduck"}:
+            if cls._is_motherduck(parsed.scheme):
                 if "disable_transactions" not in data:
                     data["disable_transactions"] = True
                 if path_db == "":

@@ -1,14 +1,15 @@
 import os
+from typing import Any
 from typing import List
 from typing import Optional
 from typing import Sequence
-
-import agate
+from typing import TYPE_CHECKING
 
 from dbt.adapters.base import BaseRelation
-from dbt.adapters.base.column import Column
+from dbt.adapters.base.column import Column as BaseColumn
 from dbt.adapters.base.impl import ConstraintSupport
 from dbt.adapters.base.meta import available
+from dbt.adapters.duckdb.column import DuckDBColumn
 from dbt.adapters.duckdb.connections import DuckDBConnectionManager
 from dbt.adapters.duckdb.relation import DuckDBRelation
 from dbt.adapters.duckdb.utils import TargetConfig
@@ -18,12 +19,21 @@ from dbt.context.providers import RuntimeConfigObject
 from dbt.contracts.connection import AdapterResponse
 from dbt.contracts.graph.nodes import ColumnLevelConstraint
 from dbt.contracts.graph.nodes import ConstraintType
+from dbt.contracts.relation import Path
+from dbt.contracts.relation import RelationType
 from dbt.exceptions import DbtInternalError
 from dbt.exceptions import DbtRuntimeError
+
+TEMP_SCHEMA_NAME = "temp_schema_name"
+DEFAULT_TEMP_SCHEMA_NAME = "dbt_temp"
+
+if TYPE_CHECKING:
+    import agate
 
 
 class DuckDBAdapter(SQLAdapter):
     ConnectionManager = DuckDBConnectionManager
+    Column = DuckDBColumn
     Relation = DuckDBRelation
 
     CONSTRAINT_SUPPORT = {
@@ -33,6 +43,9 @@ class DuckDBAdapter(SQLAdapter):
         ConstraintType.primary_key: ConstraintSupport.ENFORCED,
         ConstraintType.foreign_key: ConstraintSupport.ENFORCED,
     }
+
+    # can be overridden via the model config metadata
+    _temp_schema_name = DEFAULT_TEMP_SCHEMA_NAME
 
     @classmethod
     def date_function(cls) -> str:
@@ -46,7 +59,13 @@ class DuckDBAdapter(SQLAdapter):
         self.execute("select 1 as id")
 
     @available
-    def convert_datetimes_to_strs(self, table: agate.Table) -> agate.Table:
+    def is_motherduck(self):
+        return self.config.credentials.is_motherduck
+
+    @available
+    def convert_datetimes_to_strs(self, table: "agate.Table") -> "agate.Table":
+        import agate
+
         for column in table.columns:
             if isinstance(column.data_type, agate.DateTime):
                 table = table.compute(
@@ -81,7 +100,7 @@ class DuckDBAdapter(SQLAdapter):
         self,
         plugin_name: str,
         relation: DuckDBRelation,
-        column_list: Sequence[Column],
+        column_list: Sequence[BaseColumn],
         path: str,
         format: str,
         config: RuntimeConfigObject,
@@ -101,6 +120,13 @@ class DuckDBAdapter(SQLAdapter):
     @available
     def get_binding_char(self):
         return DuckDBConnectionManager.env().get_binding_char()
+
+    @available
+    def catalog_comment(self, prefix):
+        if DuckDBConnectionManager.env().supports_comments():
+            return f"{prefix}.comment"
+        else:
+            return "''"
 
     @available
     def external_write_options(self, write_location: str, rendered_options: dict) -> str:
@@ -192,7 +218,7 @@ class DuckDBAdapter(SQLAdapter):
         return sql
 
     @available.parse(lambda *a, **k: [])
-    def get_column_schema_from_query(self, sql: str) -> List[Column]:
+    def get_column_schema_from_query(self, sql: str) -> List[BaseColumn]:
         """Get a list of the Columns with names and data types from the given sql."""
 
         # Taking advantage of yet another amazing DuckDB SQL feature right here: the
@@ -202,7 +228,7 @@ class DuckDBAdapter(SQLAdapter):
         ret = []
         for row in cursor.fetchall():
             name, dtype = row[0], row[1]
-            ret.append(Column.create(name, dtype))
+            ret.append(DuckDBColumn.create(name, dtype))
         return ret
 
     @classmethod
@@ -214,6 +240,35 @@ class DuckDBAdapter(SQLAdapter):
             return f"references {constraint.expression}"
         else:
             return super().render_column_constraint(constraint)
+
+    def pre_model_hook(self, config: Any) -> None:
+        """A hook for getting the temp schema name from the model config"""
+        self._temp_schema_name = config.model.config.meta.get(
+            TEMP_SCHEMA_NAME, self._temp_schema_name
+        )
+        super().pre_model_hook(config)
+
+    @available
+    def get_temp_relation_path(self, model: Any):
+        """This is a workaround to enable incremental models on MotherDuck because it
+        currently doesn't support remote temporary tables. Instead we use a regular
+        table that is dropped at the end of the incremental macro or post-model hook.
+        """
+        return Path(
+            schema=self._temp_schema_name, database=model.database, identifier=model.identifier
+        )
+
+    def post_model_hook(self, config: Any, context: Any) -> None:
+        """A hook for cleaning up the remote temporary table on MotherDuck if the
+        incremental model materialization fails to do so.
+        """
+        if self.is_motherduck():
+            if "incremental" == config.model.get_materialization():
+                temp_relation = self.Relation(
+                    path=self.get_temp_relation_path(config.model), type=RelationType.Table
+                )
+                self.drop_relation(temp_relation)
+        super().post_model_hook(config, context)
 
 
 # Change `table_a/b` to `table_aaaaa/bbbbb` to avoid duckdb binding issues when relation_a/b
